@@ -340,10 +340,6 @@ class SearchWin(Gtk.Window):
         combo.get_child().set_text("")
         combo.grab_focus()
 
-    def leave(self):
-        self.destroy()
-        Gtk.main_quit()
-
     def on_quit(self, button, data=None):
         Gtk.main_quit()
         sys.exit(0)
