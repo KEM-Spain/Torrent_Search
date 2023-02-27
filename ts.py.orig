@@ -1,0 +1,682 @@
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository.Gtk import ListStore
+from gi.repository import Gtk
+from gi.repository import Gdk
+from bs4 import SoupStrainer as ss
+from bs4 import BeautifulSoup as bs
+from datetime import datetime
+import getopt
+import sys
+import subprocess
+import requests
+import re
+import numpy as np
+import os
+import logging
+
+#Constants
+TORRENT_CLIENT="/usr/bin/deluge"
+DEFAULT_ENGINE="pb"
+BOLD = "\033[1m"
+ITALIC = "\033[3m"
+WHITE = "\033[0;37m"
+RED = "\033[0;31m"
+RESET = "\033[0m"
+SUPPORTED_ENGINES = {
+    "pb": "The Pirate Bay",
+    "lime": "Lime Torrents",
+    "eztv": "Eztv Torrents"
+}
+
+SCRIPT = os.path.basename(sys.argv[0])
+
+USAGE_TXT = """
+Usage: {} [-h] [-e <ENGINE>] [<TITLE>]
+
+Options:-h: help
+        -e: <ENGINE>
+
+DESC: Search for, select, and download torrent files via Deluge.
+      Enter <TITLE> via dialog or on the command line.
+
+SUPPORTED ENGINES:
+    pb   : The Pirate Bay (default)
+    lime : Lime Torrents
+    eztv : Eztv Torrents
+
+""".format(SCRIPT)
+
+
+#Functions
+def usage():
+    print(USAGE_TXT)
+    sys.exit(0)
+
+
+def get_cmdline():
+    opts, args = [], []
+    set_opts = {"engine": DEFAULT_ENGINE}
+
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "he:", ["engine="])
+    except getopt.GetoptError as err:
+        print(err)  # option not recognized
+        usage()
+
+    for o, a in opts:
+        if o in ("-h", "--help"):
+            usage()
+        elif o in ("-e", "--engine"):
+            set_opts = {"engine": a}
+        else:
+            assert False, "unhandled option"
+
+    return set_opts, args
+
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def init_logging():
+    logger = logging.getLogger(__name__)
+    handler = logging.StreamHandler(stream=sys.stderr)
+    logger.addHandler(handler)
+    sys.excepthook = handle_exception
+
+
+def get_model(site):
+    engine_models = {
+        "pb": "PbModel",
+        "lime": "LimeModel",
+        "eztv": "EztvModel"
+    }
+    return engine_models[site]
+
+
+def get_search_term(msg=None, engine_key=None):
+    search = None
+    return_val = None
+
+    dialog = SearchDialog(msg, engine_key)
+    response = dialog.run()
+
+    if response == Gtk.ResponseType.OK:
+        search = dialog.entry.get_text()
+        if len(search) > 0: #  User entered some text
+            return_val = 0
+        else:
+            return_val = 1  #  User entered nothing and pressed OK
+    elif response == Gtk.ResponseType.CLOSE:
+        return_val = 2  #  User pressed CLOSE
+
+    dialog.destroy()
+    return return_val, search
+
+
+#Classes and Methods
+class SearchDialog(Gtk.Dialog):
+
+    def __init__(self, msg=None, engine_key=None):
+        self.msg = msg
+        self.engineKey = engine_key
+        self.title = "Torrent Search - "+SUPPORTED_ENGINES[self.engineKey]
+
+        Gtk.Dialog.__init__(self, self.title, modal=True)
+
+        Gtk.Dialog.set_default_size(self, 400, 100)
+        Gtk.Dialog.set_default_response(self, Gtk.ResponseType.OK)
+
+        Gtk.Dialog.add_button(self, "Submit", Gtk.ResponseType.OK)
+        Gtk.Dialog.add_button(self, "Exit", Gtk.ResponseType.CLOSE)
+
+        self.entry = Gtk.Entry()
+        self.entry.connect("activate", self.on_submit)  # enables enter key
+
+        self.connect('delete-event', self.on_destroy)
+
+        box = self.get_content_area()
+
+        if self.msg is not None:
+            msg = Gtk.Label(label=self.msg)
+            msg.set_markup('<span foreground="red">' + '<big>' + self.msg + '</big></span>')
+            box.add(msg)
+
+        prompt = Gtk.Label(label="")
+        prompt.set_markup( "<big>Enter title to search for...</big>")  # Pango markup
+
+        box.add(prompt)
+        box.add(self.entry)
+
+        self.show_all()
+        self.set_keep_above(True)
+
+    def on_submit(self, entry):
+        Gtk.Dialog.response(self, Gtk.ResponseType.OK)
+
+    def on_destroy(self, widget=None, *data):
+        self.destroy()
+        sys.exit(0)
+
+
+class ListingWin(Gtk.Window):
+    torrent_list_store: ListStore
+
+    def __init__(self, torrent_list, engine_key):
+        self.torrent_list = torrent_list
+        self.engine = engine_key
+
+        Gtk.Window.__init__(self, title="Torrent Listing - "+SUPPORTED_ENGINES[self.engine])
+
+        self.entry = Gtk.Entry()
+        self.entry.connect("activate", self.on_submit)  # enables enter key
+
+        self.set_border_width(10)
+        self.set_default_size(1000,400)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+
+        # Setting up the grid in which the elements are to be positioned
+        self.grid = Gtk.Grid()
+        self.grid.set_column_homogeneous(True)
+        self.grid.set_row_homogeneous(True)
+        self.add(self.grid)
+
+        # Post-process torrent_list: Create dictionary (fields 1,5) for magnet[title] lookup
+        titles, magnets = [], []
+
+        for L in self.torrent_list:
+            titles.append(L[0])
+            magnets.append(L[-1])
+
+        # Stash the magnets
+        self.magnet_dict = dict(zip(titles, magnets))
+
+        # Post-process torrent_list: Create listStore (fields 1-5) without magnets
+        post_list = np.array(self.torrent_list)
+        store_data = post_list[:, :5].tolist()  # numpy syntax for grabbing fields 1-5 from each row
+
+        # Create the ListStore model: "Title", "Date", "Seeds", "Leeches", "Size"
+        self.torrent_list_store = Gtk.ListStore(str, str, int, int, str, float)
+
+        for torrent_ref in store_data:
+            f1 = torrent_ref[0]  # title
+            f2 = torrent_ref[1]  # Date
+            f3 = int(torrent_ref[2])  # Seeds
+            f4 = int(torrent_ref[3])  # Leeches
+            f5 = torrent_ref[4]  # Size
+            #  sort MB, GB, and KiB
+            if "N/A" in f5:
+                s5 = 0
+            elif "G" in f5:
+                c5 = f5.replace('G', '')
+                n1 = float(c5)
+                n2 = float(1024)
+                s5 = n1 * n2
+            elif "M" in f5:
+                c5 = f5.replace('M', '')
+                s5 = float(c5)
+            elif "K" in f5:
+                c5 = f5.replace('KiB', '')
+                s5 = float(c5)
+            else:
+                s5 = re.sub('[^0-9\.]','', f5)
+            row = [f1, f2, f3, f4, f5, s5]
+            self.torrent_list_store.append(row)
+
+        # Create the treeview; pass the model
+        self.treeview = Gtk.TreeView()
+        self.treeview.set_model(self.torrent_list_store)
+
+        # Add columns & headers
+        renderer_1 = Gtk.CellRendererText()
+        renderer_2 = Gtk.CellRendererText()
+        renderer_2.set_property("xalign", 1)
+
+        column = Gtk.TreeViewColumn("Title", renderer_1, text=0)
+        column.set_sort_column_id(0)
+        self.treeview.append_column(column)
+
+        column = Gtk.TreeViewColumn("Date", renderer_2, text=1)
+        column.set_sort_column_id(1)
+        self.treeview.append_column(column)
+
+        column = Gtk.TreeViewColumn("Seeds", renderer_2, text=2)
+        column.set_sort_column_id(2)
+        self.treeview.append_column(column)
+
+        column = Gtk.TreeViewColumn("Leeches", renderer_2, text=3)
+        column.set_sort_column_id(3)
+        self.treeview.append_column(column)
+
+        #  Display field for Size (f4), sort field for Size (s5)
+        column = Gtk.TreeViewColumn("Size", renderer_2, text=4)
+        column.set_sort_column_id(5)
+        self.treeview.append_column(column)
+
+
+        # Define the buttons
+        self.buttons = list()
+
+        button = Gtk.Button(label="Download")
+        button.connect("clicked", self.on_download)
+        self.buttons.append(button)
+
+        button = Gtk.Button(label="Search")
+        button.connect("clicked", self.on_close)
+        self.buttons.append(button)
+
+        button = Gtk.Button(label="Quit")
+        button.connect("clicked", self.on_quit)
+        self.buttons.append(button)
+
+        self.connect('delete-event', self.on_destroy)
+
+        # Context menu - unused, only for learning purposes
+        self.treeview.connect("button_press_event", self.show_context_menu)
+
+        # Capture double click on row
+        self.treeview.connect("row-activated", self.row_active)
+
+        # Set multiple rows option
+        self.treeview.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+
+        # Set up the layout, put the treeview in a scroll window and add the buttons in a row
+        self.scrollable_treeList = Gtk.ScrolledWindow()
+        self.scrollable_treeList.set_vexpand(True)
+
+        self.grid.attach(self.scrollable_treeList, 0, 0, 8, 10)  #  row,col,(h,w cells)
+        self.grid.attach_next_to( self.buttons[0], self.scrollable_treeList, Gtk.PositionType.BOTTOM, 1, 1)
+
+        for i, button in enumerate(self.buttons[1:]):
+            self.grid.attach_next_to( button, self.buttons[i], Gtk.PositionType.RIGHT, 1, 1)
+
+        self.scrollable_treeList.add(self.treeview)
+
+        self.show_all()
+        self.set_keep_above(True)
+
+
+    # Context menu - unused, only for learning purposes
+    def show_context_menu(self, widget, event):
+
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
+            context_menu = Gtk.Menu ()
+            cm_item = Gtk.MenuItem(label="This is a usless context menu")
+            context_menu.add(cm_item)
+            cm_item = Gtk.MenuItem(label="that does nothing - but it could")
+            context_menu.add(cm_item)
+            context_menu.attach_to_widget(self, None)
+            context_menu.show_all()
+            context_menu.popup(None, None, None, None, event.button, event.time)
+
+    # If double-click on row, download and exit
+    def row_active(self, tv, col, tv_col):
+        self.on_download(self)
+        self.on_quit(self)
+
+    def on_download(self, button):
+        # Retrieve selected titles from ListStore
+        selected_titles = []
+
+        selection = self.treeview.get_selection()
+        (self.torrent_list_store, tree_iterator) = selection.get_selected_rows()
+
+        for path in tree_iterator:
+            path_iter = self.torrent_list_store.get_iter(path)
+            if path_iter is not None:
+                selected_titles.append(
+                    self.torrent_list_store.get_value(path_iter, 0))
+
+        # Pass selected magnets to torrent client and exit
+        for title in selected_titles:
+            subprocess.Popen([TORRENT_CLIENT, self.magnet_dict[title]],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        self.on_quit(self)
+
+    def on_submit(self, entry):
+        self.destroy()
+        Gtk.main_quit()
+
+    def on_close(self, button):
+        self.destroy()
+        Gtk.main_quit()
+
+    def on_destroy(self, widget=None, *data):
+        self.destroy()
+        sys.exit(0)
+
+    def on_quit(self, button):
+        self.destroy()
+        sys.exit(0)
+
+
+def filter_sz_age(tag):
+    if tag.find('a') is not None:  # eliminate <td containing <a tags
+        return False
+    return tag.name == 'td' and len(tag.attrs) == 2 and (tag.attrs["class"] == ["forum_thread_post"] and tag.attrs["align"] == 'center')
+
+
+class EztvModel:
+    myUrl = "https://eztv.re"
+
+    def get_list(search_phrase):
+        # Prep the url
+        current_search = search_phrase.replace(' ', '%20')
+        current_search = EztvModel.myUrl + '/search/' + search_phrase
+
+        # Pull the page
+        page = requests.get(current_search)
+
+        # Isolate the relevant data
+        detail = ss('tr', {'class': 'forum_header_border'})
+        soup = bs(page.content, features="html.parser", parse_only=detail)
+
+        tds = soup.find_all("td", attrs={"class": "forum_thread_post", "align": "center"})
+
+        #  Eliminate doubled magnet links; only take the first
+        a_tags = []
+        for td in tds:
+            tags = td.find_all("a", attrs={"class": "magnet"})
+            if len(tags) == 0:
+                continue
+
+            a_tags.append(tags[0])
+
+        links = [a["href"] for a in a_tags]
+        raw_titles = [a["title"] for a in a_tags]
+
+        titles = []
+        for t in raw_titles:
+            t = t.replace('Magnet Link', '') # kill link desc in title
+            t = re.sub('\[eztv\]', '', t) # kill eztv tag in title
+            t = re.sub('\(.*\)', '', t) # kill size in title
+            titles.append(t)
+
+        sz_age = []
+        for f in soup.find_all(filter_sz_age):
+            sz_age.append(str(f.get_text()).strip())
+
+        # Assign alternating rows
+        ages, raw_sizes = [], []
+        for r in range(len(sz_age)):
+            if (r % 2) == 0:
+                raw_sizes.append(sz_age[r])
+            else:
+                ages.append(sz_age[r])
+
+        # Normalize size info
+        sizes = []
+        for s in raw_sizes:
+            file_size = s
+            file_size = file_size.replace('GB', 'G')
+            file_size = file_size.replace('MB', 'M')
+            file_size = file_size.replace('KB', 'K')
+            sizes.append(file_size)
+
+        seeds_raw = soup.find_all("td", attrs={"align": "center", "class": "forum_thread_post_end"})
+        seeds_raw = [str(sd.get_text()).strip() for sd in seeds_raw]
+
+        # Filter non integer data
+        seeds = []
+        for s in seeds_raw:
+            if s.isdigit():
+                seed = s
+            else:
+                seed = 0
+            seeds.append(seed)
+
+        # No leech info provided in this model
+        leeches = ["0" for sd in seeds_raw]
+
+        # Return listStore data and provide an extra payload of link data
+        torrent_list = []
+        for t in range(0, len(titles)):
+            torrent_list.append(
+                (titles[t],
+                 ages[t],
+                 seeds[t],
+                 leeches[t],
+                 sizes[t],
+                 links[t]))
+
+        return 0, torrent_list
+
+EztvModel.get_list = staticmethod(EztvModel.get_list)
+
+
+class LimeModel:
+    myUrl = "https://www.limetorrents.lol"
+
+    def get_list(search_phrase):
+        # Prep the url
+        current_search = search_phrase.replace(' ', '%20')
+        current_search = LimeModel.myUrl + '/search/all/' + search_phrase
+
+        # Pull the page
+        page = requests.get(current_search)
+
+        # Isolate the relevant data
+        detail = ss('table', {'class': 'table2'})
+        soup = bs(page.content, features="html.parser", parse_only=detail)
+
+        # Extract raw html
+        divs = soup.find_all("div", attrs={"class": "tt-name"})
+        age_size_td = soup.find_all("td", attrs={"class": "tdnormal"})
+        leech_td = soup.find_all("td", attrs={"class": "tdleech"})
+        seed_td = soup.find_all("td", attrs={"class": "tdseed"})
+
+        # Extract text from html
+        titles = [str(div.get_text()).strip() for div in divs]
+        age_size = [str(td.get_text()).strip() for td in age_size_td]
+        leeches_raw = [str(td.get_text()).strip() for td in leech_td]
+        seeds_raw = [str(td.get_text()).strip() for td in seed_td]
+
+        # Filter non integer data
+        leeches = []
+        for l in leeches_raw:
+            if l.isdigit():
+                leech = l
+            else:
+                leech = 0
+            leeches.append(leech)
+
+        # Filter non integer data
+        seeds = []
+        for s in seeds_raw:
+            if s.isdigit():
+                seed = s
+            else:
+                seed = 0
+            seeds.append(seed)
+
+        # Extract links
+        link_tags = [div.a for div in divs]
+        links = [link['href'] for link in link_tags]
+
+        # Post-process age_size: Parse alternating pairs of age and size into separate lists: ages and sizes
+        raw_ages, raw_sizes = [], []
+
+        for z in range(len(age_size)):
+            if (z % 2) == 0:
+                raw_ages.append(age_size[z])
+            else:
+                raw_sizes.append(age_size[z])
+
+        # Scrub age text
+        ages = []
+        for a in raw_ages:
+            age_trim = re.sub('\s[-]\s.*$', '', a)
+            ages.append(age_trim)
+
+        # Normalize size info
+        sizes = []
+        for s in raw_sizes:
+            file_size = s
+            file_size = file_size.replace('GB', 'G')
+            file_size = file_size.replace('MB', 'M')
+            file_size = file_size.replace('KB', 'K')
+            sizes.append(file_size)
+
+        # Return listStore data and provide an extra payload of link data
+        torrent_list = []
+        for t in range(0, len(titles)):
+            torrent_list.append(
+                (titles[t],
+                 ages[t],
+                 seeds[t],
+                 leeches[t],
+                 sizes[t],
+                 links[t]))
+
+        return 0, torrent_list
+
+
+LimeModel.get_list = staticmethod(LimeModel.get_list)
+
+
+class PbModel:
+    myUrl = "http://thepiratebay.rocks"
+
+    def get_list(search_phrase):
+        # Prep the url
+        current_search = search_phrase.replace(' ', '%20')
+        current_search = PbModel.myUrl + '/search/' + search_phrase + '/1/99/0'
+
+        # Pull the page
+        page = requests.get(current_search)
+
+        # Extract SearchResult table
+        detail = ss('table', {'id': 'searchResult'})
+        soup = bs(page.content, features="html.parser", parse_only=detail)
+
+        # Gather the sections containing pertinent info
+        divs = soup.find_all("div", attrs={"class": "detName"})
+        links = soup.find_all("a", attrs={"title": re.compile('^Download')})
+        tds = soup.find_all("td", attrs={"align": "right"})
+        size_info = soup.find_all("font", attrs={"class": "detDesc"})
+
+        # Non result; early exit
+        if not len(divs) > 0:
+            return 1, None
+
+        # Separate info into lists
+        titles = [str(div.get_text()).strip() for div in divs]
+        magnets = [link['href'] for link in links]
+        seed_leech = [str(td.get_text()).strip()
+                      for td in tds]  # will post-process
+        raw_sizes = [str(info.get_text()).strip()
+                     for info in size_info]  # will post-process
+
+        # Post-process lists: Extract embedded size info from raw text
+        sizes = []
+        dates = []
+        for s in raw_sizes:
+            getDate = re.search('(^.*Uploaded )(.*), Size', s)
+            getSz = re.search('(^.*Size )(.*),.*$', s)
+            upload_date = getDate.group(2)
+            upload_date = upload_date.replace(u'\xa0', ' ')
+            file_size = getSz.group(2)
+            file_size = file_size.replace(u'\xa0', ' ')
+            file_size = file_size.replace('GiB', 'G')
+            file_size = file_size.replace('MiB', 'M')
+            upload_date = re.sub(' \d\d:\d\d', '-'+str(datetime.now().year), upload_date)
+            upload_date = re.sub(' (\d\d\d\d)', r"-\1", upload_date)
+            upload_date = re.sub('(\d\d)-(\d\d)-(\d\d\d\d)', r"\3-\1-\2", upload_date)
+            sizes.append(file_size)
+            dates.append(upload_date)
+
+        # Post-process lists: Parse alternating pairs of seed_leech info into separate lists: seeds and leeches
+        seeds, leeches = [], []
+
+        for z in range(len(seed_leech)):
+            if (z % 2) == 0:
+                seeds.append(seed_leech[z])
+            else:
+                leeches.append(seed_leech[z])
+
+        # Return listStore data and provide an extra payload of magnet data
+        torrent_list = []
+        for t in range(0, len(titles)):
+            torrent_list.append(
+                (titles[t],
+                 dates[t],
+                 seeds[t],
+                 leeches[t],
+                 sizes[t],
+                 magnets[t]))
+
+        return 0, torrent_list
+
+
+PbModel.get_list = staticmethod(PbModel.get_list)
+
+
+class TorrentRequest:
+    def __init__(self, model, engine_key, title_text=None):
+        self.model = eval(model)
+        self.engineKey = engine_key
+        self.title = title_text
+        self.msg = None
+
+        while True:
+            self.return_val = 0
+            self.torrent_list = None
+
+            if self.title is None:
+                self.return_val, self.search_term = get_search_term(self.msg, self.engineKey)
+            else:
+                self.search_term = self.title
+                self.title = None
+
+            self.msg = None
+
+            if self.return_val == 1:  #  User entered nothing and pressed OK
+                sys.exit(self.return_val)
+
+            if self.return_val == 2:  #  User closed the dialog
+                sys.exit(self.return_val)
+
+            if self.search_term:  #  User entered a value; query the engine
+                self.return_val, self.torrent_list = self.model.get_list(
+                    self.search_term)
+                if self.return_val == 1:  #  engine returned nothing
+                    self.msg = "No matching torrents found"
+
+            if self.torrent_list:
+                win = ListingWin(self.torrent_list, self.engineKey)
+                win.connect("delete-event", Gtk.main_quit)
+                win.show_all()
+                Gtk.main()
+
+
+# Execute
+if __name__ == "__main__":
+    init_logging()
+
+    if not os.path.exists(TORRENT_CLIENT):
+        t_client = str.title(os.path.basename(TORRENT_CLIENT))
+        app = os.path.basename(__file__)
+        app = os.path.splitext(app)[0]
+        print(f"{BOLD}{RED}Error{RESET}:{WHITE}{t_client} {RED}{ITALIC}not found{RESET}. Please install: {WHITE}{TORRENT_CLIENT}{RESET}")
+        sys.exit(1)
+
+    option_dict, title = get_cmdline()
+
+    if len(title):
+        title = ' '.join(title)
+    else:
+        title = None
+
+    engineKey = option_dict["engine"]
+
+    if engineKey not in SUPPORTED_ENGINES:
+        print(f"{BOLD}{RED}Error{RESET}: engine {engineKey} is not a supported engine")
+        sys.exit(1)
+
+    newRequest = TorrentRequest(get_model(engineKey), engineKey, title)

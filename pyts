@@ -1,0 +1,4 @@
+#!/usr/bin/zsh
+(
+exec python /usr/local/bin/__pyscripts__/pyts $@ && echo &
+) 2>/dev/null

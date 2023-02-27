@@ -1,0 +1,30 @@
+#!/usr/bin/env python
+import os
+
+# The default umask is 0o22 which turns off write permission of group and others
+file_path = r'/tmp/file.txt'
+
+#if os.path.exists(file_path):
+#    os.unlink(file_path)
+#else:
+#    print("The system cannot find the file specified")
+
+os.umask(0)
+
+descriptor = os.open(
+    file_path,
+    flags=(
+        os.O_RDWR  # access mode: write only
+        | os.O_CREAT  # create if not exists
+    ),
+    mode=0o644
+)
+
+# the descriptor is automatically closed when fh is closed
+with open(descriptor, "r+") as fh:
+    for line in fh:
+        print(line, end="")
+
+    # Writing new content to this file
+#    fh.write("Adding this new content")
+
