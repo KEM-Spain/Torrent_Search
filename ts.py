@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import gi
-
 gi.require_version('Gtk', '3.0')
 from gi.repository.Gtk import ListStore
 from gi.repository import Gtk
@@ -55,7 +54,7 @@ SUPPORTED ENGINES:
 return_val = None
 torrent_list = []
 
-# Functions
+# Module Functions
 def usage():
     print(USAGE_TXT)
     sys.exit(0)
@@ -113,24 +112,35 @@ def model_query(model, search_term):
     return return_val, torrent_list
 
 
+def filter_sz_age(tag):
+    if tag.find('a') is not None:  # eliminate <td containing <a tags
+        return False
+    return tag.name == 'td' and len(tag.attrs) == 2 and (
+            tag.attrs["class"] == ["forum_thread_post"] and tag.attrs["align"] == 'center')
+
+
 # Classes and Methods
 class SearchWin(Gtk.Window):
     def __init__(self, engine_key=None, search_term=None, set_active=None):
 
         Gtk.Window.__init__(self)
+
+        # Arg inits
         self.engine_key = engine_key
         self.search_term = search_term
         self.set_active = set_active
-        self.active_search = None
-        self.return_val = None
-        self.torrent_list = None
 
         if self.engine_key is None:
             self.engine_key = DEFAULT_ENGINE
 
         self.initial_query = False if self.search_term is None else True
 
+        # Win inits
+        self.active_search = None
+        self.return_val = None
+        self.torrent_list = None
         self.model = None
+
         self.set_model(self.engine_key)
 
         # Window setup
@@ -165,8 +175,10 @@ class SearchWin(Gtk.Window):
         # Define the ComboBox for liststore
         self.hist_combo = Gtk.ComboBox.new_with_model_and_entry(self.hist_store)
         self.hist_combo.set_entry_text_column(1)
+
         if self.set_active is not None:
             self.hist_combo.set_active(self.set_active)
+
         self.connect("key-release-event", self.on_enter, self.hist_combo)  # engage the enter key
 
         # Define the buttons and handlers
@@ -181,14 +193,14 @@ class SearchWin(Gtk.Window):
         buttons.append(button)
 
         button = Gtk.Button(label="Clear History")
-        button.connect("clicked", self.on_clear, self.hist_combo)
+        button.connect("clicked", self.on_clear_hist, self.hist_combo)
         buttons.append(button)
 
         button = Gtk.Button(label="Quit")
         button.connect("clicked", self.on_quit)
         buttons.append(button)
 
-        # prompt - indicates unsuccessful query
+        # Entry prompt - also indicates unsuccessful query
         self.prompt = Gtk.Label()
         self.prompt.set_xalign(0.0)  # left align label
         self.set_prompt(True)
@@ -278,7 +290,6 @@ class SearchWin(Gtk.Window):
             return
 
     def on_search(self, button, combo):
-        self.active_search = combo.get_active()
         entry = combo.get_child()
         self.search_term = entry.get_text()
 
@@ -286,6 +297,8 @@ class SearchWin(Gtk.Window):
             combo.grab_focus()
             return
 
+        self.store_manager(self.search_term, combo)
+        self.active_search = combo.get_active()
         self.do_threaded_query()
 
     def do_threaded_query(self):
@@ -324,16 +337,17 @@ class SearchWin(Gtk.Window):
             if key == self.engine_key:
                 continue
             cm_item = Gtk.MenuItem(label=value)
-            cm_item.connect("activate", self.on_popup, key)
+            cm_item.connect("activate", self.engine_change_popup, key)
             context_menu.add(cm_item)
 
         context_menu.show_all()
         context_menu.popup(None, None, None, None, 1, 1)
 
-    def on_popup(self, menu, key):
+    def engine_change_popup(self, menu, key):
         self.set_model(key)
+        self.hist_combo.grab_focus()
 
-    def on_clear(self, button, combo):
+    def on_clear_hist(self, button, combo):
         os.remove(self.hist_file_path)
         self.new_hist()
         self.hist_store.clear()
@@ -354,9 +368,12 @@ class ListingWin(Gtk.Window):
 
         Gtk.Window.__init__(self, title="Torrent Listing - " + SUPPORTED_ENGINES[self.engine])
 
+        # Action vars
         self.new_search = False
         self.new_engine = False
         self.download = False
+
+        # Win inits
         self.popup_entry = None
         self.selected_titles = None
 
@@ -512,14 +529,14 @@ class ListingWin(Gtk.Window):
                 if key == self.engine:
                     continue
                 cm_item = Gtk.MenuItem(label=value)
-                cm_item.connect("activate", self.on_popup)
+                cm_item.connect("activate", self.engine_change_popup)
                 context_menu.add(cm_item)
 
             context_menu.attach_to_widget(self, None)
             context_menu.show_all()
             context_menu.popup(None, None, None, None, event.button, event.time)
 
-    def on_popup(self, popup):
+    def engine_change_popup(self, popup):
         entry = popup.get_child()
         text = entry.get_text()
         for key, value in SUPPORTED_ENGINES.items():
@@ -558,12 +575,6 @@ class ListingWin(Gtk.Window):
         Gtk.main_quit()
         sys.exit(0)
 
-
-def filter_sz_age(tag):
-    if tag.find('a') is not None:  # eliminate <td containing <a tags
-        return False
-    return tag.name == 'td' and len(tag.attrs) == 2 and (
-            tag.attrs["class"] == ["forum_thread_post"] and tag.attrs["align"] == 'center')
 
 
 class EztvModel:
@@ -835,6 +846,7 @@ PbModel.get_list = staticmethod(PbModel.get_list)
 
 
 class TorrentRequest:
+    # Manages activites between search and listing
     def __init__(self, engine_key=None, search_term=None):
         self.engine_key = engine_key
         self.search_term = search_term
